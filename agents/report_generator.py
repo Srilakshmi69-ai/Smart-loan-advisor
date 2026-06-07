@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import Any
 from crewai import Agent, Task
-from crewai.tools import tool
+from crewai import tool
 from utils.llm_client import get_crewai_llm
 from utils.logger import get_logger, log_agent_action
 from utils.pdf_report import generate_pdf_report
