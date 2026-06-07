@@ -3,14 +3,12 @@ import json
 from datetime import datetime
 from typing import Any
 from crewai import Agent, Task
-from crewai import tool
 from utils.llm_client import get_crewai_llm
 from utils.logger import get_logger, log_agent_action
 from utils.pdf_report import generate_pdf_report
 
 logger = get_logger("ReportGeneratorAgent")
 
-@tool("Generate PDF Report Tool")
 def generate_pdf_report_tool(customer_id: int, tips: Any, output_path: str = None) -> str:
     """
     Generates a professional 5-page PDF report based on the customer ID and the generated financial tips.
@@ -102,7 +100,7 @@ def get_report_generator_agent():
                 "into clean, well-formatted, and visually stunning PDF reports for clients."
             ),
             llm=llm,
-            tools=[generate_pdf_report_tool],
+            tools=[],
             verbose=True,
             memory=False
         )
