@@ -131,7 +131,7 @@ api_key = os.getenv("GROQ_API_KEY")
 if not api_key or api_key == "your_groq_api_key_here":
     logger.warning("GROQ_API_KEY is not set or contains the default placeholder. API calls will fail.")
 
-def get_langchain_groq_model(model_name="llama3-8b-8192", temperature=0.2):
+def get_langchain_groq_model(model_name="llama-3.1-8b-instant", temperature=0.2):
     """
     Returns a ChatGroq instance for use with LangChain and CrewAI.
     """
@@ -150,7 +150,7 @@ def get_langchain_groq_model(model_name="llama3-8b-8192", temperature=0.2):
 def get_crewai_llm():
     return ChatGroq(
         api_key=os.getenv("GROQ_API_KEY"),
-        model="llama3-8b-8192",
+        model="llama-3.1-8b-instant",
         temperature=0.3
     )
 
@@ -188,7 +188,7 @@ class GroqRawWrapper:
                 else:
                     raise e
 
-def get_raw_gemini_model(model_name="llama3-8b-8192"):
+def get_raw_gemini_model(model_name="llama-3.1-8b-instant"):
     """
     Compatibility wrapper returning a raw Groq executor mimicking Gemini interface.
     """

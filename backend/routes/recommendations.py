@@ -162,7 +162,7 @@ def generate_direct_loan_advisory(profile, customer_id):
                 client = Groq(api_key=groq_key)
                 def generate_explanation(loan, customer):
                     response = client.chat.completions.create(
-                        model="llama3-8b-8192",
+                        model="llama-3.1-8b-instant",
                         messages=[{"role": "user", "content": f"In 2 sentences explain why {loan['bank_name']} {loan['loan_type']} at {loan['interest_rate']}% is good for a customer with income {customer['monthly_income']} and credit score {customer['credit_score']}"}],
                         max_tokens=100
                     )
