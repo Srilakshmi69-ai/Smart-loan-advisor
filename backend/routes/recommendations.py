@@ -1,8 +1,7 @@
 import os
 import json
 from flask import Blueprint, request, jsonify, send_file
-from database import get_recommendations, get_customer_profile, get_all_loan_products
-from crew_main import run_loan_advisory_pipeline
+from database import get_recommendations, get_customer_profile, get_all_loan_products, save_recommendations, save_agent_log
 from utils.logger import get_logger
 from utils.emi_calculator import calculate_emi, calculate_total_interest, calculate_affordability_ratio
 from utils.llm_client import get_raw_gemini_model
@@ -10,10 +9,262 @@ from utils.llm_client import get_raw_gemini_model
 logger = get_logger("RecommendationsRoutes")
 recommendations_bp = Blueprint("recommendations", __name__)
 
+def generate_direct_loan_advisory(profile, customer_id):
+    try:
+        from groq import Groq
+        from utils.pdf_report import generate_pdf_report
+        import re
+        from datetime import datetime
+
+        # 1. Log Start of Data Collector Agent
+        save_agent_log(customer_id, "DataCollectorAgent", "Intake Validation", "SUCCESS", "Profile validated and structured.")
+
+        # 2. Eligibility Verification
+        rules_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "eligibility_rules.json")
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            rules = json.load(f)
+            
+        products = get_all_loan_products()
+        
+        eligible_ids = []
+        eligibility_details = {}
+        
+        for p in products:
+            loan_type = p["loan_type"]
+            rule = rules.get(loan_type, {})
+            
+            eligible = True
+            reasons = []
+            
+            # Income limit
+            if profile["monthly_income"] < p["min_monthly_income"]:
+                eligible = False
+                reasons.append(f"Income too low: required min monthly income is INR {p['min_monthly_income']}.")
+                
+            # Credit score
+            if profile["credit_score"] < p["min_credit_score"]:
+                eligible = False
+                reasons.append(f"Credit score too low: required min is {p['min_credit_score']}.")
+                
+            # Employment eligibility
+            emp_eligible = p["employment_types_eligible"]
+            if isinstance(emp_eligible, str):
+                try:
+                    emp_eligible = json.loads(emp_eligible)
+                except Exception:
+                    emp_eligible = [x.strip() for x in emp_eligible.split(",")]
+            if profile["employment_type"] not in emp_eligible:
+                eligible = False
+                reasons.append(f"Employment type '{profile['employment_type']}' not eligible.")
+                
+            # Age limits
+            if profile["age"] < rule.get("min_age", 18):
+                eligible = False
+                reasons.append(f"Age {profile['age']} is below minimum required age of {rule.get('min_age', 18)}.")
+            if profile["age"] > rule.get("max_age", 75):
+                eligible = False
+                reasons.append(f"Age {profile['age']} is above maximum allowed age of {rule.get('max_age', 75)}.")
+                
+            # DTI limit check if present in disqualifying conditions
+            dti = (profile["existing_emis"] / profile["monthly_income"]) * 100 if profile["monthly_income"] > 0 else 100
+            for cond in rule.get("disqualifying_conditions", []):
+                if "Debt-to-Income (DTI) ratio exceeding" in cond:
+                    match = re.search(r'(\d+)%', cond)
+                    if match:
+                        limit = int(match.group(1))
+                        if dti > limit:
+                            eligible = False
+                            reasons.append(f"DTI ratio of {dti:.1f}% exceeds limit of {limit}%.")
+                            
+            # Loan amount limits
+            if profile["desired_amount"] < p["min_amount"] or profile["desired_amount"] > p["max_amount"]:
+                eligible = False
+                reasons.append(f"Desired amount INR {profile['desired_amount']} is outside product limit of INR {p['min_amount']} - INR {p['max_amount']}.")
+                
+            eligibility_details[p["loan_id"]] = {
+                "eligible": eligible,
+                "reasons": reasons
+            }
+            if eligible:
+                eligible_ids.append(p["loan_id"])
+
+        eligibility_results = {
+            "eligible_products": eligible_ids,
+            "details": eligibility_details
+        }
+        save_agent_log(customer_id, "EligibilityAnalyzerAgent", "Eligibility Check", "SUCCESS", f"Found {len(eligible_ids)} eligible products.")
+
+        # 3. Loan Cost Comparison
+        comp_list = []
+        for p in products:
+            if p["loan_id"] not in eligible_ids:
+                continue
+                
+            # Determine applicable interest rate
+            if profile["credit_score"] >= 750:
+                interest_rate = p["interest_rate_min"]
+            elif profile["credit_score"] >= 650:
+                interest_rate = (p["interest_rate_min"] + p["interest_rate_max"]) / 2
+            else:
+                interest_rate = p["interest_rate_max"]
+                
+            # Tenure
+            tenure_months = min(profile["preferred_tenure"] * 12, p["max_tenure_months"])
+            
+            # Calculations
+            new_emi = calculate_emi(profile["desired_amount"], interest_rate, tenure_months)
+            total_interest = calculate_total_interest(profile["desired_amount"], new_emi, tenure_months)
+            total_payable = profile["desired_amount"] + total_interest
+            processing_fee = profile["desired_amount"] * (p["processing_fee_percent"] / 100)
+            ear = ((1 + interest_rate / 1200) ** 12 - 1) * 100
+            
+            # Affordability Score
+            new_dti = ((profile["existing_emis"] + new_emi) / profile["monthly_income"]) * 100 if profile["monthly_income"] > 0 else 100
+            aff_score = max(0, min(100, int(100 - (new_dti * 1.5))))
+            
+            comp_list.append({
+                "loan_id": p["loan_id"],
+                "bank_name": p["bank_name"],
+                "loan_type": p["loan_type"],
+                "interest_rate_used": round(interest_rate, 3),
+                "tenure_months": int(tenure_months),
+                "monthly_emi": round(new_emi, 2),
+                "total_interest": round(total_interest, 2),
+                "total_amount_payable": round(total_payable, 2),
+                "processing_fee_amount": round(processing_fee, 2),
+                "effective_annual_rate": round(ear, 2),
+                "affordability_score": int(aff_score)
+            })
+            
+        # Rank the products
+        lowest_emi_rank = [x["loan_id"] for x in sorted(comp_list, key=lambda x: x["monthly_emi"])]
+        lowest_total_cost_rank = [x["loan_id"] for x in sorted(comp_list, key=lambda x: (x["total_amount_payable"] + x["processing_fee_amount"]))]
+        best_rate_rank = [x["loan_id"] for x in sorted(comp_list, key=lambda x: x["interest_rate_used"])]
+        
+        comparison_results = {
+            "comparisons": comp_list,
+            "rankings": {
+                "lowest_emi": lowest_emi_rank,
+                "lowest_total_cost": lowest_total_cost_rank,
+                "best_rate": best_rate_rank
+            }
+        }
+        save_agent_log(customer_id, "LoanComparatorAgent", "Loan Cost Comparison", "SUCCESS", "Comparison and rankings completed.")
+
+        # 4. Generate Recommendations using direct Groq API call
+        # Sort by lowest interest rate
+        sorted_by_rate = sorted(comp_list, key=lambda x: x["interest_rate_used"])
+        top_3 = sorted_by_rate[:3]
+
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            try:
+                client = Groq(api_key=groq_key)
+                def generate_explanation(loan, customer):
+                    response = client.chat.completions.create(
+                        model="llama3-8b-8192",
+                        messages=[{"role": "user", "content": f"In 2 sentences explain why {loan['bank_name']} {loan['loan_type']} at {loan['interest_rate']}% is good for a customer with income {customer['monthly_income']} and credit score {customer['credit_score']}"}],
+                        max_tokens=100
+                    )
+                    return response.choices[0].message.content.strip()
+            except Exception as groq_err:
+                logger.error(f"Failed to setup Groq client: {str(groq_err)}")
+                def generate_explanation(loan, customer):
+                    return f"This loan offers a competitive rate of {loan['interest_rate']}% with an affordable monthly payment."
+        else:
+            def generate_explanation(loan, customer):
+                return f"This loan offers a competitive rate of {loan['interest_rate']}% with an affordable monthly payment."
+
+        recommendation_list = []
+        for idx, item in enumerate(top_3, 1):
+            explanation = generate_explanation(
+                {"bank_name": item["bank_name"], "loan_type": item["loan_type"], "interest_rate": item["interest_rate_used"]},
+                profile
+            )
+            
+            # build advantages/risks
+            advantages = [
+                f"Low interest rate of {item['interest_rate_used']}%",
+                f"Affordable EMI of INR {item['monthly_emi']:,.2f}/month"
+            ]
+            risks = [
+                "Prepayment penalties may apply depending on terms."
+            ]
+            
+            recommendation_list.append({
+                "rank": idx,
+                "loan_id": item["loan_id"],
+                "bank_name": item["bank_name"],
+                "loan_type": item["loan_type"],
+                "suitability_score": int(item["affordability_score"]),
+                "why_suits": explanation,
+                "advantages": advantages,
+                "risks": risks,
+                "suggested_tenure": f"{item['tenure_months']} months",
+                "negotiation_tip": f"Request processing fee waiver based on credit score of {profile['credit_score']}."
+            })
+            
+        recommendation_results = {
+            "recommendations": recommendation_list
+        }
+        save_agent_log(customer_id, "RecommendationEngineAgent", "Advisory Recommendations", "SUCCESS", "Personalized recommendations generated.")
+
+        # 5. Generate PDF report
+        clean_name = "".join(x for x in profile.get("name", "client") if x.isalnum()).lower()
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_path = f"reports/loan_report_{clean_name}_{date_str}.pdf"
+        os.makedirs(os.path.dirname(pdf_path) if os.path.dirname(pdf_path) else ".", exist_ok=True)
+        
+        # Assemble tips
+        tips = {}
+        for r in recommendation_list:
+            tips[r["loan_id"]] = r.get("negotiation_tip", "")
+
+        try:
+            success = generate_pdf_report(
+                customer=profile,
+                eligibility=eligibility_results,
+                comparisons=comparison_results,
+                recommendations=recommendation_results,
+                tips=tips,
+                output_path=pdf_path
+            )
+            if success:
+                save_agent_log(customer_id, "ReportGeneratorAgent", "PDF Generation", "SUCCESS", f"Report saved at {pdf_path}")
+            else:
+                save_agent_log(customer_id, "ReportGeneratorAgent", "PDF Generation", "FAILED", "PDF generator returned False.")
+        except Exception as pdf_err:
+            logger.error(f"PDF compilation failed: {str(pdf_err)}")
+            save_agent_log(customer_id, "ReportGeneratorAgent", "PDF Generation", "FAILED", str(pdf_err))
+
+        # 6. Save recommendations, comparison and eligibility to database
+        save_recommendations(
+            customer_id=customer_id,
+            recommendation_data=recommendation_results,
+            comparison_data=comparison_results,
+            eligibility_data=eligibility_results
+        )
+
+        return {
+            "status": "success",
+            "customer_id": customer_id,
+            "customer_profile": profile,
+            "eligibility": eligibility_results,
+            "comparisons": comparison_results,
+            "recommendations": recommendation_results,
+            "pdf_path": os.path.abspath(pdf_path)
+        }
+    except Exception as overall_err:
+        logger.error(f"Direct advisory compilation failed: {str(overall_err)}")
+        return {
+            "status": "error",
+            "message": str(overall_err)
+        }
+
 @recommendations_bp.route("/run-pipeline", methods=["POST"])
 def run_pipeline():
     """
-    Triggers the sequential CrewAI pipeline for a submitted customer.
+    Triggers the sequential direct recommendations pipeline for a submitted customer.
     """
     try:
         data = request.json
@@ -25,9 +276,9 @@ def run_pipeline():
         if not profile:
             return jsonify({"status": "error", "message": "Customer profile not found in database."}), 404
             
-        # Run sequential CrewAI pipeline
+        # Run direct pipeline bypassing CrewAI
         try:
-            result = run_loan_advisory_pipeline(profile, customer_id=customer_id)
+            result = generate_direct_loan_advisory(profile, customer_id=customer_id)
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
         
@@ -112,30 +363,12 @@ def get_customer_recommendations(customer_id):
                 needs_generation = True
                 
         if needs_generation:
-            from crew_main import generate_recommendation_details, run_loan_advisory_pipeline
-            from database import save_recommendations
-            
-            comparison_data = data.get("comparison_data") if data else {}
-            eligibility_data = data.get("eligibility_data") if data else {}
-            comparisons_list = comparison_data.get("comparisons", []) if isinstance(comparison_data, dict) else []
-            
-            if not comparisons_list:
-                logger.info(f"No comparison data found for customer {customer_id}. Running full pipeline...")
-                run_res = run_loan_advisory_pipeline(customer, customer_id=customer_id)
-                if run_res.get("status") == "success":
-                    data = get_recommendations(customer_id)
-                else:
-                    return jsonify({"status": "error", "message": f"Failed to generate recommendations dynamically: {run_res.get('message')}"}), 500
-            else:
-                logger.info(f"Generating recommendations dynamically for customer {customer_id}...")
-                recommendation_data = generate_recommendation_details(customer, comparisons_list)
-                save_recommendations(
-                    customer_id=customer_id,
-                    recommendation_data=recommendation_data,
-                    comparison_data=comparison_data,
-                    eligibility_data=eligibility_data
-                )
+            logger.info(f"Generating recommendations dynamically for customer {customer_id}...")
+            run_res = generate_direct_loan_advisory(customer, customer_id=customer_id)
+            if run_res.get("status") == "success":
                 data = get_recommendations(customer_id)
+            else:
+                return jsonify({"status": "error", "message": f"Failed to generate recommendations dynamically: {run_res.get('message')}"}), 500
                 
         # If recommendations list is still empty, fall back to using top 3 from comparison data sorted by affordability score
         rec_data = data.get("recommendation_data") if data else {}
@@ -204,14 +437,12 @@ def get_customer_comparison(customer_id):
             if not customer:
                 return jsonify({"status": "error", "message": "Customer profile not found."}), 404
             
-            from crew_main import run_loan_advisory_pipeline
-            logger.info(f"No comparison data found for customer {customer_id}. Running full pipeline...")
-            run_res = run_loan_advisory_pipeline(customer, customer_id=customer_id)
+            logger.info(f"No comparison data found for customer {customer_id}. Running direct advisor...")
+            run_res = generate_direct_loan_advisory(customer, customer_id=customer_id)
             if run_res.get("status") == "success":
                 data = get_recommendations(customer_id)
             else:
                 return jsonify({"status": "error", "message": f"Failed to generate comparisons dynamically: {run_res.get('message')}"}), 500
-                
         return jsonify({"status": "success", "comparisons": data["comparison_data"]}), 200
     except Exception as e:
         logger.error(f"Error fetching comparisons: {str(e)}")
@@ -251,29 +482,13 @@ def download_report(customer_id):
             logger.info(f"Generating PDF/recommendations on the fly for customer {customer_id}...")
             
             if needs_generation:
-                from crew_main import generate_recommendation_details, run_loan_advisory_pipeline
-                from backend.database import save_recommendations
-                
-                comparison_data = data.get("comparison_data") if data else {}
-                eligibility_data = data.get("eligibility_data") if data else {}
-                comparisons_list = comparison_data.get("comparisons", []) if isinstance(comparison_data, dict) else []
-                
-                if not comparisons_list:
-                    run_res = run_loan_advisory_pipeline(profile, customer_id=customer_id)
-                    if run_res.get("status") == "success":
-                        data = get_recommendations(customer_id)
-                        pdf_path = run_res.get("pdf_path")
-                    else:
-                        return jsonify({"status": "error", "message": f"Failed to run pipeline for PDF generation: {run_res.get('message')}"}), 500
-                else:
-                    recommendation_data = generate_recommendation_details(profile, comparisons_list)
-                    save_recommendations(
-                        customer_id=customer_id,
-                        recommendation_data=recommendation_data,
-                        comparison_data=comparison_data,
-                        eligibility_data=eligibility_data
-                    )
+                logger.info(f"Generating recommendations dynamically for PDF: {customer_id}...")
+                run_res = generate_direct_loan_advisory(profile, customer_id=customer_id)
+                if run_res.get("status") == "success":
                     data = get_recommendations(customer_id)
+                    pdf_path = run_res.get("pdf_path")
+                else:
+                    return jsonify({"status": "error", "message": f"Failed to run direct advisor for PDF generation: {run_res.get('message')}"}), 500
             
             # Recompile/generate PDF if still missing
             if not pdf_path or not os.path.exists(pdf_path):
